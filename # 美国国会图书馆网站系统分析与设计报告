@@ -1,0 +1,1005 @@
+# 美国国会图书馆网站系统分析与设计报告
+
+> 课程：信息系统分析与设计　|　研究对象：美国国会图书馆（Library of Congress, LOC）官方网站及馆藏访问平台
+> 分析框架：领域对象建模 · 系统应用架构设计 · 接口层设计
+> 撰写时间：2026 年 11 月
+
+## 摘要
+
+本报告以美国国会图书馆官方网站（loc.gov）、在线目录（catalog.loc.gov）及其背后的馆藏访问平台（Library Collections Access Platform, LCAP）为研究对象，围绕**领域对象建模、系统应用架构设计、接口层设计**三个系统总体设计理论方面，通过 UML 类图、状态图、时序图、构件图与软件分层架构图，并结合典型设计模式，分析一个超大规模数字图书馆系统的总体设计。报告的核心结论是：LOC 以"**可标识资源（Item / Resource / File）**"为语义骨架、以"**统一资源端点 + 表示协商（`?fo=json`）**"为接口策略、以"**门户—API—微服务—存储**"为分层协作方式，使领域模型、应用架构与接口设计三者互相印证、共同支撑了馆藏的"可发现、可访问、可引用、可扩展"。
+
+## 阅读须知：证据分级与分析边界
+
+本报告严格区分三类内容，正文以标记注明：
+
+| 标记 | 含义 | 举例 |
+|---|---|---|
+| **【A】** | 官方资料可证实的实际功能与技术事实 | API 端点、参数、限流规则、IIIF 服务、LCAP 新闻稿 |
+| **【B】** | 依据公开页面行为与业务逻辑建立的分析模型 | 类名、分层划分、构件划分、设计模式归属，均**不代表 LOC 内部真实源代码或部署** |
+| **【C】** | 分析者提出的架构优化建议 | 结构化错误返回、游标分页等 |
+
+本报告不编造 LOC 的内部数据库结构、真实类名、未公开接口、服务器架构。凡官方未公开的实现（如检索引擎的具体产品、编程语言、云部署方式），一律标注为推断或不予断言。
+
+**图目录**：图 1 领域对象 UML 类图；图 2 检索请求生命周期状态图；图 3 数字资源可得性状态图；图 4 馆藏资源检索时序图；图 5 数字资源访问时序图；图 6 第三方 API 调用时序图；图 7 系统 UML 构件图；图 8 软件分层架构图；图 9 设计模式综合应用示意图。
+
+---
+
+# 一、研究对象及业务背景
+
+## 1.1 关键前提：这是"一组系统"，而不是"一个网站"
+
+分析 LOC 的第一件事，是把官方资料中可以确认的几个系统区分开【A】：
+
+| 系统 | 入口 / 域名 | 定位 | 主要内容 |
+|---|---|---|---|
+| loc.gov 数字馆藏门户 | www.loc.gov | 面向公众的数字内容展示与检索门户 | 已数字化藏品、展览、活动、博客、新闻、立法等站点内容 |
+| loc.gov JSON/YAML API | www.loc.gov 任意已迁移端点 + `?fo=json` | 结构化数据接口；官方明示其"最初为驱动 loc.gov 网站而设计" | items（照片、地图、手稿、音视频等）、collections、images、metadata |
+| 在线目录 | catalog.loc.gov（现行公开目录界面位于 search.catalog.loc.gov，2025 年 6 月 30 日上线） | 书目级发现与获取入口，覆盖**含未数字化**的馆藏 | 书目/馆藏/件记录、读者账户、到馆请求 |
+| LCAP 平台 | 内部平台（FOLIO 开源平台，EBSCO 实施） | "馆藏发现、描述与管理的中枢"，目标是让用户"无缝发现和获取全部馆藏，无论数字或实体、自有或授权" | 采购、编目、电子资源管理、发现、流通 |
+| 数字化交付微服务 | tile.loc.gov 等 | 图像、文本、音视频的机器可读交付 | IIIF 图像服务、OCR 文本服务、流媒体服务 |
+| 书目与关联数据服务 | id.loc.gov、lccn.loc.gov、SRU/Z39.50 网关 | 规范与书目元数据的机读访问 | LCSH/名称规范、MARCXML、SRU 检索 |
+
+三条最关键的官方事实，构成后续全部分析的锚点：
+
+1. **loc.gov 与目录是两套发现体系**。JSON/YAML API 官方文档明确说明："该 API **不包含图书馆目录（catalog）中的记录**（已数字化的条目除外）"，完整目录记录需通过 MARC 开放数据集或 SRU/Z39.50 网关获取【A】。
+2. **网站与 API 共用同一套资源端点**。loc.gov 的条目页、集合页、检索页本身就是由 JSON 数据构建的；在页面 URL 后加 `?fo=json` 即可获得同一资源的机器可读表示【A】。
+3. **2025 年目录换代**。LCAP 项目于 2022 年选定开源平台 FOLIO 为基础，由 EBSCO 实施；2024 年 10 月完成采购一期、12 月完成电子资源管理与发现，2025 年 6 月 30 日公开上线新目录【A】。
+
+## 1.2 重点业务与规模约束
+
+重点业务为六项：**馆藏资源检索、检索结果展示、馆藏资源详情查看、数字资源访问、资源元数据展示、网站 API 及外部系统交互**。
+
+支撑这些业务的规模量级（引自 LOC 官方馆情通报【A】，仅用于说明约束条件）：
+
+- 目录集成系统（当时为 Voyager 10.3）含约 **2,030 万条书目记录、2,896 万条件记录、1,179 万条规范记录**；
+- Z39.50/SRU 元数据检索服务每年接受约 **4.57 亿次**请求；
+- LCCN 永久链接服务（lccn.loc.gov）年请求量超过 **1.15 亿次**；
+- 约 3,000 余条 EAD 检索工具支撑对 **8,350 万件档案**的访问。
+
+由这些数字可以直接推导出若干设计约束，它们将在后文反复出现：
+
+1. **必须限流**：无鉴权的公开 API 若不限速，极易被批量抓取拖垮（官方因此设置了每分钟请求数上限与封禁机制）。
+2. **必须分面**：面对千万级记录，纯关键词检索无法收敛结果（官方因此提供 `fa` 分面参数，并建议以分面收窄代替深层翻页）。
+3. **元数据必然异构**：馆藏来自照片、手稿、报纸、地图、音视频等不同部组，各部组编目实践不同（官方文档因此明确警告：item 字段"因集合而异，最好不要依赖其存在性、数据类型和取值"）。
+4. **权利状态必然多样**：同一批馆藏中既有公有领域内容，也有仅在馆内（Stacks 阅览室）可用的受限资源。
+
+## 1.3 与三个理论方面的对应
+
+| 理论方面 | 在 LOC 业务中的落点 |
+|---|---|
+| 领域对象建模 | 资源（Item）—数字对象（Resource）—文件（File）—元数据—权利—用户—检索请求等对象及其关系 |
+| 系统应用架构设计 | 门户构件、检索服务、资源聚合、元数据 ETL、数字访问、账户权限、API 门面等构件划分 |
+| 接口层设计 | JSON/YAML API 参数契约、IIIF/文本/流媒体微服务接口、SRU/Z39.50、限流与错误约定 |
+
+---
+
+# 二、领域对象建模与 UML 类图分析
+
+## 2.1 建模方法：从业务用例出发识别对象
+
+领域对象建模要求对象对应**实际业务概念**而非网页或数据库表。本章采用三步法：
+
+1. **从业务用例提取名词短语**：围绕"用户检索馆藏 → 浏览结果 → 查看详情 → 访问数字内容 → 引用资源"这条主用例流，得到候选对象：用户、检索请求、检索条件、检索结果、分面、资源、集合、元数据、数字对象、文件、分段、权利策略、引用。
+2. **用对象判据筛选**：有独立标识、被多方引用、有自身生命周期的立为**实体**（资源、集合、数字对象、用户、检索请求）；只在某次交互中存在、无可变状态的立为**值对象**（检索条件、分面值、访问决定、引用文本）。避免"一切皆实体"导致模型臃肿。
+3. **为每个对象分配单一业务职责**，作为后续高内聚评价与构件划分的基础。
+
+## 2.2 领域对象清单及其 LOC 业务对应
+
+下表中"LOC 证据"均为可在官方 API 文档或页面行为中观察到的对应物【A】，类名本身为分析模型【B】：
+
+| 分析对象 | 类型 | 业务含义 | LOC 可观察证据 |
+|---|---|---|---|
+| 用户 User | 实体 | 检索者；部分能力（登录、到馆请求、受限资源）需要身份 | 新目录支持登录、读者卡预注册、找回账户【A】；受限资源仅馆内可用【A】 |
+| 检索请求 SearchRequest | 实体（会话级） | 一次检索的完整意图及其生命周期 | 一次 `/search/?q=…&fa=…` 请求的全过程 |
+| 检索条件 SearchQuery | 值对象 | 关键词、分面、排序、分页的组合 | `q / fa / sb / c / sp / dates` 参数【A】 |
+| 检索结果集 SearchResult | 值对象（每次请求生成） | 命中摘要列表 + 分面 + 分页信息 | 响应中的 `results / facets / pagination` 三要素【A】 |
+| 结果摘要 ItemSummary | 值对象 | 条目概要，不等于完整元数据 | 官方说明：需再请求 item 端点才能取得完整元数据【A】 |
+| 分面值 FacetValue | 值对象 | 一个可点击的过滤维度取值及其命中数 | `facets.filters`（term/count/on URL）【A】 |
+| 馆藏资源 Item | 实体 | 书目实体：可独立标识、可被引用、可数字化也可不数字化 | `/item/{id}` 端点；LCCN 控制号；`digitized` 布尔字段【A】 |
+| 馆藏集合 Collection | 实体 | 按主题或原则组织的一组资源 | `/collections/{slug}` 端点；`partof` 字段【A】 |
+| 元数据 Metadata | 实体（依附于资源） | 多来源描述属性的聚合 | `item` 对象字段（title/date/contributors/subject_headings/language/rights…），且"因部组而异"【A】 |
+| 数字对象 DigitalResource | 实体 | 资源的一个可独立寻址的数字表示（如报纸的某一期） | `/resource/{id}` 端点；`segments` 分段【A】 |
+| 文件 File | 实体（依附于数字对象） | 具体比特流及访问方式（IIIF 图像、PDF、MP3、OCR 文本） | `resources[].files[]`（mimetype/url/width/height/duration/info）【A】 |
+| 分段 Segment | 实体 | 数字对象内部结构单元（报纸页、图册中的单幅地图） | `segments` 属性，官方明示"报纸的 segment 通常是某期的页"【A】 |
+| 权利策略 AccessPolicy | 实体 | 决定谁能以何种方式访问 | `access_restricted / rights_advisory / download_restricted` 字段【A】 |
+| 访问决定 AccessDecision | 值对象 | 一次裁决的结论 | 页面行为：公开可看 / 仅缩略图 / 仅馆内 / 不可访问 |
+| 引用 Citation | 值对象 | 按引用规范生成的引用文本 | `cite_this`（Chicago/MLA/APA，官方标注为实验性）【A】 |
+| 检索服务 SearchService | 服务 | 执行检索、聚合分面 | `/search`、`/{format}`、`/collections/{slug}`、`/search/index/{field}` 端点【A】 |
+| 访问服务 AccessService | 服务 | 解析并交付数字内容，执行权利约束 | IIIF / 文本 / 流媒体三类微服务【A】 |
+
+## 2.3 UML 类图
+
+```mermaid
+classDiagram
+direction TB
+
+class IdentifiableResource {
+  <<abstract>>
+  可标识资源：统一标识与引用入口
+  +String id
+  +String url
+  +String title
+  +生成引用(style) Citation
+}
+class User {
+  用户
+  +String userId
+  +权限集 privileges
+  +是否登录 bool
+  +发起检索(条件) SearchRequest
+  +请求资源(资源) AccessDecision
+}
+class SearchRequest {
+  检索请求
+  +DateTime 提交时间
+  +String 状态
+  +校验() bool
+  +下一页() SearchRequest
+}
+class SearchQuery {
+  <<valueObject>>
+  检索条件
+  +String keywords
+  +List facetFilters
+  +String sortBy
+  +int page
+  +int perPage
+  +拼接查询串() String
+}
+class SearchResult {
+  <<valueObject>>
+  检索结果集
+  +int 总命中数
+  +int 当前页
+  +命中列表()
+  +可用分面()
+}
+class ItemSummary {
+  <<valueObject>>
+  结果摘要
+  +String id
+  +String title
+  +String date
+  +String imageUrl
+}
+class FacetValue {
+  <<valueObject>>
+  分面值
+  +String 维度
+  +String 取值
+  +int 命中数
+  +String 过滤后URL
+}
+class Item {
+  馆藏资源（书目实体）
+  +String lccn
+  +String shelfId
+  +List originalFormat
+  +List onlineFormat
+  +bool digitized
+  +bool hasSegments
+  +是否已数字化() bool
+  +主数字资源() DigitalResource
+}
+class Collection {
+  馆藏集合
+  +String slug
+  +String 主题
+  +包含资源() List
+}
+class Metadata {
+  元数据（多来源聚合）
+  +List 贡献者
+  +List 主题词
+  +List 语言
+  +List 权利说明
+  +List 载体类型
+  +可检索字段() List
+}
+class DigitalResource {
+  数字对象（可寻址表示）
+  +String uuid
+  +String 类型
+  +可用文件(类型) List
+  +分段列表() List
+}
+class FileRecord {
+  文件
+  +String mimetype
+  +int width
+  +int height
+  +int duration
+  +String iiifInfoUrl
+  +String 下载地址
+  +解析图像(region, size) String
+}
+class Segment {
+  分段（报纸页/图册单幅）
+  +int 序号
+  +String 标题
+}
+class AccessPolicy {
+  权利策略
+  +bool accessRestricted
+  +List rightsAdvisory
+  +bool downloadRestricted
+  +裁决(用户, 文件) AccessDecision
+}
+class AccessDecision {
+  <<valueObject>>
+  访问决定
+  +String 结论
+  +String 提示文案
+}
+class Citation {
+  <<valueObject>>
+  引用
+  +String style
+  +String text
+}
+class SearchService {
+  检索服务
+  +执行检索(SearchRequest) SearchResult
+  +分面索引(维度) List
+}
+class AccessService {
+  访问服务
+  +裁决访问(用户, 资源) AccessDecision
+  +图像地址(文件, region, size) String
+  +全文与词坐标(资源) Object
+  +流媒体地址(文件) String
+}
+class MetadataService {
+  元数据处理服务
+  +聚合多源描述(资源) Metadata
+  +转换书目格式() Metadata
+}
+
+%% ===== 泛化 =====
+Item --|> IdentifiableResource : 泛化
+DigitalResource --|> IdentifiableResource : 泛化
+Collection --|> IdentifiableResource : 泛化
+
+%% ===== 关联 / 组合 / 聚合 =====
+User "1" --> "0..*" SearchRequest : 发起
+SearchRequest "1" *-- "1" SearchQuery : 组合（条件随请求存在）
+SearchRequest "1" ..> "1" SearchResult : 由服务产生
+SearchResult "1" o-- "1..25" ItemSummary : 每页摘要
+SearchResult "1" *-- "1..8" FacetValue : 分面
+ItemSummary "0..*" ..> "1" Item : 取完整详情（依赖）
+Collection "1" o-- "0..*" Item : 聚合（集合解散资源仍在）
+Item "1" *-- "1" Metadata : 组合（描述与资源共生）
+Item "1" o-- "0..*" DigitalResource : 聚合（可未数字化）
+DigitalResource "1" *-- "1..*" FileRecord : 组合
+DigitalResource "1" *-- "0..*" Segment : 组合
+Item "1" --> "1" AccessPolicy : 受约束于
+AccessService "0..*" ..> "1" AccessPolicy : 依据
+AccessService "0..*" ..> "1" DigitalResource : 交付
+SearchService "0..*" ..> "1" SearchRequest : 处理
+MetadataService ..> Metadata : 生成
+IdentifiableResource ..> Citation : 生成引用
+
+note for IdentifiableResource "依据【A】：item 与 resource 两类响应均提供 cite_this 引用字段，说明存在统一的可引用资源抽象"
+note for Item "依据【A】：digitized 可为 false——只有书目描述的条目仍可检索，故 DigitalResource 用 0..* 聚合"
+note for AccessPolicy "依据【A】：access_restricted（仅馆内）、rights_advisory、download_restricted 均为公开字段"
+```
+
+**图 1 说明**：本图为分析模型【B】，其中每一处结构与关系均有可观察的官方依据（图中注释标出）。类名不是 LOC 内部真实类名。
+
+## 2.4 类图要点解读
+
+**（1）领域对象如何对应实际业务。** "馆藏资源 Item"对应的是业务意义上的"一件藏品/一个可编目单元"，而不是一个网页：同一 Item 可以没有数字对象（`digitized=false`，只有书目描述【A】），也可以有多个数字对象（如报纸的每一期各自拥有 `/resource/{id}`【A】）。这正是"对象对应业务概念，而非页面划分"的直接体现。
+
+**（2）三层资源结构是全模型的骨架。** Item（逻辑实体）→ DigitalResource（可寻址表示）→ File（具体比特流）的三层组合，精确对应官方 API 的 `/item` → `/resource` → `resources[].files[]` 结构，以及"报纸（item）—某期（resource）—页面图像/OCR（files/segments）"的业务分层【A】。这一结构同时承载了元数据与内容两条线索。
+
+**（3）元数据与数字对象分离。** Metadata 以组合关系挂在 Item 上，而不是挂在 DigitalResource 上。理由有二：其一，未数字化条目也有元数据；其二，数字对象可以更换（重新扫描、更换派生格式）而描述不变。这对应"数据层中书目元数据与数字对象存储分开管理"的架构事实（第七章）。
+
+**（4）泛化关系有真实证据。** item 端点与 resource 端点的响应**都包含** `cite_this` 引用属性【A】，说明两类资源共享"可标识、可引用"的公共语义，因此抽象出 IdentifiableResource，并让引用生成、URL 解析等行为可以多态地作用于三类资源。这也是里氏替换原则（LSP）的落点：任何子类替换 IdentifiableResource 出现的位置（如引用生成器），行为契约不被破坏。
+
+**（5）组合与聚合的取舍。** 集合与资源用**聚合**：官方对 collection 的定义是"专家按主题组织的条目组"，条目先于集合存在，集合解散条目不消失【A】。文件与数字对象用**组合**：派生文件脱离其数字对象没有独立业务意义。这些取舍本身就是"围绕同一业务职责组织属性与行为"的高内聚体现。
+
+**（6）封装的落点。** 检索条件 SearchQuery 把 `q/fa/sb/c/sp/dates` 六个参数、深层分页 100,000 条上限、每页不超过 1,000 条的规则全部封装在"拼接查询串"等少数方法之后【A 证据，B 封装】；外部对象（用户界面、第三方调用方）不直接操作参数字符串，从而把"参数组合规则变化"的影响限制在一个类内——这正是封装"隐藏内部实现、降低外部依赖"的目的。
+
+**（7）高内聚、低耦合的对照。** 权利策略 AccessPolicy 独立成类，而不是把权利判断逻辑散落在检索、展示、下载各处，使得"权利规则变化"只影响一个对象；访问服务 AccessService 只依赖 AccessPolicy 与 DigitalResource 的抽象职责，不关心权利数据来自哪个部组——这是低耦合。反之，如果把"检索""展示""权利判断""文件下载"塞进同一个 Resource 大类，就会违反单一职责。第 2.3 图中没有任何一个类同时承担两条以上互不相关的业务职责。
+
+**（8）类图为应用架构提供基础。** 类图中的服务类（SearchService、AccessService、MetadataService）与数据边界（File 属于 DigitalResource、Metadata 多源聚合）在第五章将一一映射为构件：检索服务类 → 检索构件；访问服务类 → 数字资源访问构件；MetadataService → 元数据处理构件。领域模型的职责边界先行确定，构件划分只是把这些职责按部署与协作需求再聚合一次——这正是"类图为系统应用架构提供基础"的含义。
+
+---
+
+# 三、UML 状态图分析
+
+状态图刻画有明确生命周期的对象。本章选取两个业务上真实存在状态流转的对象：**检索请求**（会话级生命周期，其异常状态有官方文档依据）与**馆藏资源的数字可得性**（资源级生命周期，其状态差异反映在公开字段中）。二者均为分析模型【B】，但每个转换都对应可观察的公开行为【A】。
+
+## 3.1 图 2：检索请求的生命周期
+
+```mermaid
+stateDiagram-v2
+direction LR
+[*] --> 输入中 : 用户打开检索页
+输入中 --> 提交校验 : 用户提交（回车/点击）
+提交校验 --> 检索执行中 : 参数合法（进入检索服务）
+提交校验 --> 输入中 : 参数非法，提示修正
+检索执行中 --> 结果呈现 : 返回命中（results 非空）
+检索执行中 --> 结果呈现 : 无命中（展示无结果与改词建议）
+检索执行中 --> 限流拦截 : 触发速率上限（429，封禁约1小时）
+检索执行中 --> 人机挑战 : 返回人机校验页（高峰期可能出现）
+人机挑战 --> 检索执行中 : 通过校验后重试
+限流拦截 --> [*] : 封禁期满后可重新发起
+结果呈现 --> 检索执行中 : 应用分面/翻页/改排序（构造新查询）
+结果呈现 --> 结果呈现 : 同页翻页（页深不超过100000条）
+结果呈现 --> 详情查看 : 点击某条结果（转条目端点）
+详情查看 --> 结果呈现 : 返回结果列表
+结果呈现 --> [*] : 结束会话
+
+note right of 检索执行中
+  依据【A】：q 在元数据与全文（含视频字幕）中检索；
+  深层分页超过 100000 条不被支持；
+  超限返回 429 或校验页，JSON API 限 20 次/分钟。
+end note
+```
+
+**图 2 说明**：检索请求是典型的会话级对象：出生（提交）→ 执行 → 呈现 → 细化（分面/翻页构造出**新的**查询条件，即状态图中"结果呈现 → 检索执行中"的自环迁移）→ 终止。三个异常状态全部有官方依据：限流封禁约 1 小时、高峰期可能出现 CAPTCHA 页、深层分页超过 100,000 条不被支持【A】。"页深超过上限"在图中不作为独立状态，而是作为"同页翻页"转换的**监护条件**——超过条件即请求失败，这与官方"建议用分面收窄代替深翻页"的引导一致。
+
+## 3.2 状态语义与转换条件明细
+
+| 状态 | 含义 | 进入事件 | 关键转换条件 |
+|---|---|---|---|
+| 输入中 | 用户构造检索条件 | 打开检索页 / 上次校验失败 | 参数完整且合法 → 提交校验通过 |
+| 检索执行中 | 服务执行匹配、聚合分面 | 校验通过 | 有/无命中、是否触发限流或校验页 |
+| 结果呈现 | 展示摘要与分面 | 执行完成（含空结果） | 用户细化（新查询）、点击条目、结束 |
+| 详情查看 | 查看单个条目 | 点击摘要条目 | 返回结果列表 |
+| 限流拦截 | 请求被速率控制拒绝 | 超过 20 次/分钟【A】 | 封禁期满（约 1 小时）后可重试【A】 |
+| 人机挑战 | 返回挑战页 | 高峰期自动风控【A】 | 通过后重试 |
+
+## 3.3 图 3：馆藏资源"数字可得性"的生命周期
+
+```mermaid
+stateDiagram-v2
+direction TB
+[*] --> 未数字化 : 完成编目（元数据就绪）
+未数字化 --> 数字化加工中 : 馆方启动数字化项目
+数字化加工中 --> 已上线_公开访问 : 扫描/OCR/ETL完成且权利允许
+数字化加工中 --> 已上线_受限访问 : 加工完成但仅馆内可用
+已上线_公开访问 --> 已上线_受限访问 : 权利复核收紧（如隐私评估）
+已上线_受限访问 --> 已上线_公开访问 : 权利开放或到期
+已上线_公开访问 --> 暂时撤下 : 权利或内容问题
+已上线_受限访问 --> 暂时撤下 : 权利或内容问题
+暂时撤下 --> 已上线_公开访问 : 复核通过重新发布
+已上线_公开访问 --> [*] : 常态（长期在线）
+note right of 已上线_受限访问
+  依据【A】：access_restricted=true 的条目仅馆内可完整访问，
+  馆外用户可能仅见低分辨率缩略图或纯书目信息；
+  resources[].files[] 中存在 download_restricted 字段。
+end note
+note left of 未数字化
+  依据【A】：API 明示不含未数字化目录记录，
+  此类条目须经由目录（LCAP）体系发现。
+end note
+```
+
+**图 3 说明**：一件馆藏的数字可得性并非一成不变：官方字段 `digitized`、`access_restricted`、`download_restricted` 证明"未数字化 / 已数字化但受限 / 公开在线"是真实并存的三种业务状态【A】；`extract_timestamp`（最近一次 ETL 时间戳）的存在则说明上线过程经由数据加工管线【A】。"权利复核收紧/开放"与"暂时撤下"两个转换在官方文档中无逐条对应，属于依据图书馆业务常规建立的合理推断，读者应按【B】理解。
+
+## 3.4 状态图与领域对象建模的关系
+
+两张状态图分别给图 1 中的 **SearchRequest** 与 **DigitalResource（及其 AccessPolicy）** 补上了时间维度：类图回答"对象有哪些职责"，状态图回答"这些职责在生命周期中何时被履行、被什么事件触发、受什么条件约束"。例如，AccessPolicy 类的"裁决"方法之所以在访问时序图（图 5）中被调用，正是因为资源可能处于"公开/受限/未数字化"不同状态；检索请求的限流与深翻页约束，则解释了 SearchQuery 封装分页规则的设计必要性。状态图因此成为连接领域模型与交互设计（第四章）的桥梁。
+
+---
+
+# 四、UML 交互图分析
+
+本章以两个主场景 + 一个扩展场景绘制时序图。参与者中标注【A】的为官方证实的端点/服务，标注【B】的为分析推断的内部编排层。
+
+## 4.1 场景一：馆藏资源检索（图 4）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant FE as 浏览器前端
+    participant APP as 应用层编排（渲染/路由）【B】
+    participant API as JSON API 检索服务 /search【A】
+    participant IDX as 检索引擎索引层【B·产品未公开】
+    participant MET as 聚合元数据【A】
+
+    U->>FE: 输入关键词并提交
+    FE->>APP: GET /search/?q=关键词
+    APP->>API: 转发查询（fo=json）
+    API->>API: 校验并规范化 q/fa/c/sp/sb
+    API->>IDX: 元数据+全文匹配（含 OCR 全文与字幕）
+    IDX-->>API: 命中文档集合
+    API->>MET: 读取命中条目的聚合描述
+    MET-->>API: 条目摘要（title/date/image_url 等）
+    API->>API: 聚合 facets 与 pagination
+    API-->>APP: JSON（results + facets + pagination）
+    APP-->>FE: 渲染结果页 HTML
+    FE-->>U: 结果列表 + 左侧分面导航
+
+    opt 细化检索
+        U->>FE: 点击分面/翻页/改排序
+        FE->>APP: 携带 fa/sp/sb 的新请求（返回步骤 2）
+    end
+
+    alt 触发限流或人机挑战【A】
+        API-->>APP: 429 或挑战页（超限封禁约 1 小时）
+        APP-->>U: 限流/校验提示
+    else 无命中
+        API-->>APP: results 为空
+        APP-->>U: 无结果提示与改词建议
+    else 深层分页超限【A】
+        APP-->>U: 建议以分面收窄结果集
+    end
+```
+
+**图 4 说明**：消息 5—8 体现了接口层的职责分工——检索服务只负责"匹配与组织"，条目级描述来自聚合元数据，分面与分页信息在服务侧统一组装。消息 2 中前端直接以 GET + 查询串提交，说明检索请求是**无状态**的：会话上下文完全编码在 URL 参数里，这正是 SearchQuery 值对象在交互层的投影，也让"复制链接分享检索结果"成为可能。
+
+## 4.2 场景二：数字资源访问（图 5）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant FE as 浏览器前端
+    participant APP as 应用层（资源详情聚合）【B】
+    participant API as 条目端点 /item/{id}【A】
+    participant POL as 权利裁决【B·依据公开字段】
+    participant IIIF as IIIF 图像服务 tile.loc.gov【A】
+    participant TXT as 文本服务（OCR/词坐标）【A】
+    participant AV as 流媒体服务【A】
+
+    U->>FE: 点击某条检索结果
+    FE->>APP: 请求条目页 /item/{id}/
+    APP->>API: GET /item/{id}/?fo=json（可用 at=item,resources 裁剪）
+    API-->>APP: item（书目+权利字段）+ resources（文件清单）
+    APP->>POL: 裁决该用户对该资源的访问方式
+    POL-->>APP: 访问决定（公开在线 / 受限 / 未数字化）
+
+    alt 公开可在线访问
+        APP->>IIIF: 请求缩略图或瓦片（region/size/rotation）
+        IIIF-->>FE: 返回图像
+        opt 条目含全文
+            APP->>TXT: 请求 OCR 全文与词坐标
+            TXT-->>FE: 全文文本/高亮坐标
+        end
+        opt 音视频资源
+            APP->>AV: 请求播放流
+            AV-->>FE: 音视频流
+        end
+        FE-->>U: 详情页 + 在线查看器（权利允许时可下载）
+    else 受限资源 access_restricted=true
+        APP->>IIIF: 仅请求低分辨率缩略图（若有）
+        IIIF-->>FE: 缩略图
+        FE-->>U: 仅书目信息 + 到馆使用指引（Stacks 馆内访问）
+    else 未数字化
+        FE-->>U: 仅元数据展示，并给出目录/馆藏位置线索
+    end
+
+    opt 生成引用
+        APP-->>FE: cite_this（Chicago/MLA/APA，实验性）【A】
+    end
+```
+
+**图 5 说明**：本图的核心结构是**权利裁决位于内容交付之前**：应用层先依据 item 响应中的 `access_restricted / rights_advisory` 等字段做出访问决定，再决定调用哪个微服务、以何种参数调用（受限资源仅请求低清缩略图）。三类微服务（图像/文本/流媒体）按资源载体类型各司其职、互不替代，印证了第二章"File 按类型提供不同访问方法"的领域建模。官方文档还明示检索元数据**不包含目录记录**【A】，因此"未数字化"分支最终把用户指向目录体系（LCAP），这正是两套发现体系在交互层面的衔接点。
+
+## 4.3 场景三：第三方系统经 API 批量调用（图 6）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor DEV as 第三方开发者/研究系统
+    participant API as JSON/YAML API 检索端点【A】
+    participant ITM as 条目端点【A】
+    participant LIM as 限流控制（边缘层）【A/B】
+
+    DEV->>API: /search/?q=…&fo=json&c=1000&sp=1&at=results
+    API-->>DEV: JSON（results + pagination）
+    loop 按分面收窄后逐页遍历
+        DEV->>API: sp+1 翻页（每页不超过1000条）
+        API-->>DEV: 下一页结果
+    end
+    loop 逐条获取完整元数据
+        DEV->>ITM: /item/{id}/?fo=json&at=item,resources
+        ITM-->>DEV: 完整条目与文件清单
+    end
+    opt 本地整理
+        DEV->>DEV: 以 id 字段对多分面结果去重
+    end
+    alt 超过 20 次/分钟
+        LIM-->>DEV: 429（封禁约 1 小时）
+        DEV->>DEV: 暂停并在封禁期后重试
+    end
+```
+
+**图 6 说明**：本图直接按官方文档建议的批量获取模式绘制【A】：先用分面把大结果集拆成若干小于 100,000 条的子集，再逐页（每页 ≤1,000 条）遍历，最后逐条取完整元数据并按 `id` 去重（因为同一资源可能命中多个分面）。这印证了两点：其一，公开 API 的能力边界（分页、限流）已经实质性地塑造了外部调用方的交互形态；其二，`at` 字段裁剪参数在交互层面落实了"客户端不依赖不需要的数据"的接口隔离思想。
+
+## 4.4 交互图与接口层设计的印证
+
+三幅时序图共同暴露出 LOC 交互方式的稳定特征【A/B 综合】：（1）全部采用**同步 HTTP 请求—响应**，无公开的长连接或回调机制；（2）会话无状态，上下文编码于 URL 参数；（3）数据交换统一为 JSON/YAML（图像、音视频走行业标准 IIIF 与流协议）；（4）跨模块交互经由明确的端点契约而非内部调用泄漏。这些特征将在第六章接口层设计中逐一展开。
+
+---
+
+# 五、系统应用架构与 UML 构件图分析
+
+## 5.1 构件识别与职责
+
+构件划分依据三条线索：官方证实的端点与服务分类【A】、响应结构中的职责痕迹（如 `group` 与 `extract_timestamp` 字段揭示多 ETL 管线的存在【A】）、以及第四章时序图中反复出现的编排角色【B】。构件名与类名一样，属分析模型。
+
+| 构件 | 功能职责 | 提供的接口 | 需要的接口 | 证据等级 |
+|---|---|---|---|---|
+| loc.gov 门户构件 | 检索页、集合页、条目页、专题页的用户交互与呈现 | 页面 UI（人机接口） | 检索接口、条目接口、图像/文本/流媒体接口 | A（端点）/B（划分） |
+| 目录前端构件 | 书目检索、分面收窄、账户、到馆请求 | 页面 UI、登录界面 | 目录后端接口、账户接口 | A（功能证实）/B（划分） |
+| IIIF 查看器构件 | 图像缩放/定位、音视频播放、全文对照 | 查看器 UI | IIIF 图像接口、流媒体接口、文本接口 | A/B |
+| API 门面构件 | 统一端点路由、`fo` 格式协商、`at` 字段裁剪、参数规范 | `/search`、`/{format}`、`/collections`、`/item`、`/resource` | 检索服务、资源服务 | A（端点证实）/B（门面定位） |
+| 检索服务构件 | 关键词+全文匹配、分面聚合、排序、分页控制、深层分页限制 | 检索接口（经门面） | 检索索引 | A（行为）/B（划分） |
+| 馆藏资源构件 | item/resource 聚合、文件清单组织、引用生成 | 条目接口（经门面） | 元数据存储、访问构件、权利数据 | A/B |
+| 元数据处理构件 | 多来源描述的抽取—转换—装载（ETL）、索引更新 | （内部）加工管线 | 各部组源数据、检索索引 | A（字段痕迹）/B（划分） |
+| 数字资源访问构件 | IIIF/文本/流媒体的编排与权利约束执行 | 图像/文本/流媒体接口 | 数字对象存储、权利策略、账户数据 | A（微服务证实）/B（编排） |
+| 账户与权限构件 | 登录、读者卡、到馆请求、馆内权限 | 账户接口 | 账户数据、机构认证 | A（功能证实）/B（划分） |
+
+## 5.2 UML 构件图
+
+> 说明：Mermaid 无原生 UML 构件图语义，本图以双子矩形表示构件、圆圈表示接口（矩形单/双层仅为视觉区分），依赖关系用虚线，语义与 UML 构件图一致。
+
+```mermaid
+flowchart LR
+  U1["公众用户 / 研究者"]
+  U2["第三方开发者与外部系统"]
+
+  subgraph FE["表现层构件"]
+    P1[["loc.gov 门户构件"]]
+    P2[["目录前端构件（LCAP）"]]
+    P3[["资源查看器构件"]]
+  end
+
+  subgraph SVC["应用服务构件"]
+    GW[["API 门面构件（fo/at/路由）"]]
+    SC[["检索服务构件"]]
+    IC[["馆藏资源构件"]]
+    MC[["元数据处理构件（ETL）"]]
+    AC[["数字资源访问构件"]]
+    AU[["账户与权限构件"]]
+  end
+
+  subgraph IF["对外接口（圆圈=接口）"]
+    I1((检索/条目接口<br>…?fo=json))
+    I3((IIIF 图像接口))
+    I4((文本服务接口))
+    I5((流媒体接口))
+    I7((SRU/Z39.50 接口))
+    I8((关联数据接口<br>id.loc.gov))
+  end
+
+  subgraph DATA["数据存储"]
+    IX[("检索索引")]
+    MDS[("书目/规范元数据<br>MARC·BIBFRAME·MODS·EAD")]
+    DFS[("数字对象存储 storage-services")]
+    ADS[("账户数据")]
+  end
+
+  subgraph EXT["外部数据服务"]
+    E1[["Congress.gov API"]]
+    E2[["Chronicling America API"]]
+    E3[["研究工具 / 数据分析应用"]]
+  end
+
+  U1 --> P1
+  U1 --> P2
+  P1 -- 检索/条目请求 --> I1
+  P2 -- 账户与到馆请求 --> AU
+  P3 -- 取图/取流/取文 --> I3
+  I1 --> GW
+  GW --> SC
+  GW --> IC
+  SC -.-> IX
+  IC -.-> MDS
+  IC --> AC
+  AC -- 提供 --> I3
+  AC -- 提供 --> I4
+  AC -- 提供 --> I5
+  AC -.-> DFS
+  AC -. 权利裁决 .-> AU
+  MC -- 建索引/更新 --> IX
+  MC -.-> MDS
+  MC -. 规范词表共享 .-> I8
+  AU -.-> ADS
+  SC -. 立法类结果 .-> E1
+  SC -. 报纸数字化数据 .-> E2
+  U2 --> I1
+  U2 --> I7
+  U2 --> I8
+  E3 -.-> I1
+```
+
+**图 7 说明**：图中可以读出四组协作关系：（1）**门面收敛**——门户构件与第三方只面对 I1 一个检索/条目接口，其后由门面构件分派给检索构件或资源构件；（2）**读写分离**——元数据处理构件单向地向索引供数（写侧管线），检索构件只读索引，二者互不穿透；（3）**访问构件是权利的执行点**——所有微服务接口（I3/I4/I5）由它统一提供，账户构件以虚线参与裁决；（4）**目录前端走独立链路**（P2 → AU），不经 loc.gov 门面，对应"两套发现体系"的业务现实。
+
+## 5.3 依据架构原则的评价
+
+- **模块化**：构件边界与官方功能分类（检索 / 条目 / 集合 / 图像 / 文本 / 流媒体 / 账户）一一对应，职责边界清楚【A】。
+- **高内聚低耦合**：每个构件围绕单一资源职责组织；构件之间只见接口不见实现。可见的耦合点只有两处：元数据异构性迫使资源构件做多源兼容（内聚性代价），以及权利裁决需要账户构件参与（必要的业务耦合）。
+- **可复用**：同一套检索/条目接口同时服务门户页面、目录链接、第三方开发者与数据分析工具（图 7 中 E3），且官方明示 API"最初为驱动网站而设计"【A】——网站本身即是接口复用的第一个消费者。
+- **可扩展**：官方文档列出的 `/{format}` 端点族（photos、maps、audio、film-and-videos、web-archives 等）说明新增一种载体类型即新增一个格式端点，而端点结构不变【A】；LCAP 选择开源 FOLIO 也明确以"可随需求变化成长"为动机【A】。
+- **可维护性**：检索索引、元数据、数字对象分库而治，单个构件故障影响面可控；但门户与目录两套前端并存也意味着功能迭代要照顾两处（第七章展开）。
+- **SOLID 对照**：SRP——每个构件单一职责，成立；OCP——新增资源类型靠"新增端点/新增微服务"扩展而不改既有契约，成立；LSP——item 与 resource 响应共享同一结构骨架（cite_this/item/resources），可互换消费，成立；ISP——`at` 参数允许客户端只取所需字段，避免被迫接收无关数据，成立；DIP——门面与微服务均以稳定接口（URL 契约）暴露，调用方不依赖其内部实现，成立。以上均为基于公开行为的分析判断【B】。
+
+---
+
+# 六、接口层设计分析
+
+## 6.1 接口全景
+
+LOC 对外暴露的机器可读接口如下（全部为官方证实【A】）：
+
+| 接口 | 端点/地址 | 职责 | 速率限制 |
+|---|---|---|---|
+| JSON/YAML API | `www.loc.gov/{endpoint}/?fo=json|yaml` | 集合、条目、检索的结构化数据 | 20 次/分钟，超限封禁约 1 小时 |
+| Sitemaps | XML 站点地图 | 页面关系发现（爬取友好） | — |
+| 文本服务 | （OCR 全文、词坐标、片段） | 全文检索与文本挖掘 | 150 次/分钟 |
+| 图像服务 | `tile.loc.gov/image-services/iiif/{id}/{region}/{size}/{rotation}/{quality}.{format}` | IIIF 标准图像交付与缩放 | 150 次/分钟 |
+| 流媒体服务 | A/V 交付 | 音视频流 | 60 次/分钟 |
+| 媒体存储 | `/storage-services/` | 媒体文件直取 | 150 次/分钟 |
+| MARCXML | `lccn.loc.gov/{item-id}/marcxml` | 条目书目记录机读形式 | 30 次/分钟，超限封禁 72 小时 |
+| SRU / Z39.50 网关 | （标准协议服务） | 完整目录记录检索（MARC 21/MARCXML/MODS/DC/BIBFRAME） | — |
+| 关联数据服务 | id.loc.gov | 规范与主题词表的关联数据 | — |
+| 其他 | Congress.gov API、Chronicling America API、PPOC JSON API、NLS BARD API | 各自业务域的数据服务 | 各自规定 |
+
+**推测的内部接口【B】**：目录前端与 FOLIO 后端之间、ETL 管线与索引之间、门户页面服务与 API 之间的内部调用均未公开。本报告不将其当作事实，仅在构件图中以虚线表示"必然存在某种协作"。
+
+## 6.2 核心设计："同一资源，多种表示"
+
+JSON/YAML API 最重要的接口决策是：**API 与网站共用同一套资源 URL**。对任何已迁移页面追加 `?fo=json`（或 `fo=yaml`）即可获得该资源的机器可读表示【A】。这意味着：
+
+1. **资源与表示分离**（REST 思想）：URL 标识资源本身，`fo` 参数选择表示形式，人类界面与机器接口不分裂成两套地址体系；
+2. **接口天然可复用**：网站前端就是 API 的第一个客户端，任何为页面做的功能必然以 API 能力为前提，公开接口与内部需求不会漂移太远；
+3. **稳定性有制度支撑**：LCCN 永久链接（lccn.loc.gov）与 handle 服务保证资源标识长期可解析【A】，接口地址层面的低耦合有持久标识体系托底。
+
+## 6.3 请求契约与响应契约
+
+**请求参数契约【A】**：
+
+| 参数 | 名称 | 取值/格式 | 业务含义 |
+|---|---|---|---|
+| `q` | 关键词 | 任意词组 | 在元数据与全文（含视频字幕）中检索 |
+| `fa` | 分面过滤 | `维度:值`，多值以竖线连接 | access-restricted、digitized、contributor、language、location、subject、online-format、original-format、partof 等；官方注明分面值**不是受控词表** |
+| `fo` | 表示格式 | json / yaml | 表示协商 |
+| `at` | 字段裁剪 | 逗号分隔、点路径、`at!=` 排除 | 只返回所需属性，如 `at=item,resources` |
+| `c` | 每页条数 | 默认 25，建议 ≤1000 | 分页大小 |
+| `sp` | 页码 | 从 1 起 | 翻页 |
+| `sb` | 排序 | date / date_desc / title_s / title_s_desc / shelf_id / shelf_id_desc | 排序规则 |
+| `dates` | 日期范围 | 起/止年份 | 按年代收窄 |
+
+**响应契约【A】**：检索端点统一返回 `results`（摘要列表）+ `facets`（分面）+ `pagination`（分页信息）三要素；条目端点返回 `item`（书目描述）、`resources`（数字表示及文件清单）、`cite_this`（引用）等。`item` 内字段如 `title / date / contributor_names / subject_headings / language / rights_advisory / digitized / access_restricted / hassegments / image_url / shelf_id / library_of_congress_control_number` 等；`resources[].files[]` 内含 `mimetype / url / width / height / duration / info`（IIIF info）等。
+
+**契约强度的诚实评估**：官方文档明确警告 item 字段"因部组而异，最好不要依赖其存在性、数据类型和取值"，`cite_this` 被标注为实验性【A】。也就是说，这是一个**弱模式（schema-flexible）契约**：端点与顶层结构稳定，叶子字段开放。这降低了各部组数据接入的门槛（可扩展性优先），但把适配负担转嫁给了调用方。
+
+## 6.4 限流、错误与可靠性
+
+官方可靠性设计【A】：
+
+- 无需 API 密钥即可访问（开放优先），但以**速率限制**代替身份门槛：JSON API 20 次/分钟，超限**封禁约 1 小时**；高峰期可能提前出现 429 或人机校验页，官方建议调用方对 429 实现暂停重试；
+- **深层分页限制**：超过 100,000 条的翻页不被支持（搜索引擎内存代价所致），官方引导改为"分面收窄 + 分片遍历 + 本地按 id 去重"；
+- **每页上限建议** 1,000 条；
+- MARCXML 端点限 30 次/分钟，超限封禁 72 小时（高价值数据更严格）。
+
+这套设计把"可靠性"建立在**资源保护的粗粒度闸门 + 官方引导的调用模式**上，而不是精细的配额体系。
+
+## 6.5 接口安全与身份
+
+- 公开 API 无鉴权【A】；防护依赖限流、封禁与人机挑战。可观察的外部行为显示站点边缘存在机器人缓解机制（自动化访问会遇到挑战页）【B·外部观察，非官方文档】。
+- 需要身份的业务收敛在目录侧：新目录的登录、读者卡预注册、到馆请求、找回账户等【A】；图书馆侧长期使用机构认证服务（Shibboleth）【A·馆情通报】。
+- 权利安全在**数据字段层面**表达：`access_restricted`、`rights_advisory`、`download_restricted` 随条目下发，由前端与访问链路执行【A】——即"权利策略随元数据分发、在访问时裁决"的模式。
+
+## 6.6 接口设计五项要求的逐条评价
+
+| 要求 | LOC 的落实 | 评价 |
+|---|---|---|
+| 职责明确 | 端点按资源类型划分（search/collections/format/item/resource），微服务按载体划分（图像/文本/流媒体） | 优秀【A】 |
+| 标准化 | JSON/YAML 统一交换格式；图像采用行业标准 IIIF；书目采用 SRU/Z39.50、MARCXML、BIBFRAME | 优秀【A】 |
+| 低耦合 | 资源 URL 即标识且长期稳定（LCCN/handle）；`at` 裁剪减少客户端对无关字段的依赖 | 良好，但叶子字段弱模式削弱了强耦合禁止力【A】 |
+| 可复用可扩展 | 网站与第三方共用同一 API；新载体类型以新端点/新微服务接入 | 优秀【A】 |
+| 安全与可靠 | 限流 + 封禁 + 人机挑战 + 深翻页限制；身份收敛于目录侧 | 可用，属"防御性配额"而非"精细化配额"【A】 |
+
+**改进建议【C】**：为 429 响应提供结构化错误体与 `Retry-After` 头；为批量场景提供游标分页（search_after 式）或官方批量导出端点，以替代"分面分片 + 本地去重"的约定俗成；为 item 叶子字段提供可选的 schema 版本声明，降低调用方适配成本；对 `cite_this` 等实验性能力给出明确的稳定性承诺级别。
+
+---
+
+# 七、软件架构体系分析
+
+## 7.1 逻辑分层模型
+
+需要先声明：**以下分层是本报告用于课程分析的逻辑架构模型【B】，不代表 LOC 官方公布的技术部署架构**。分层的依据是官方证实的功能分布【A】与第六章接口观察。
+
+## 7.2 软件分层架构图
+
+```mermaid
+flowchart TB
+  U["用户：公众 / 研究者 / 开发者 / 国会与馆内人员"]
+
+  subgraph L1["表现层"]
+    direction LR
+    W1["loc.gov 门户页面"]
+    W2["目录前端（LCAP）"]
+    W3["资源查看器（IIIF/播放器/全文）"]
+  end
+
+  subgraph L2["应用层"]
+    direction LR
+    A1["检索编排与分面聚合"]
+    A2["资源详情聚合"]
+    A3["访问裁决与会话"]
+    A4["元数据 ETL 编排"]
+  end
+
+  subgraph L3["接口层"]
+    direction LR
+    B1["JSON/YAML API"]
+    B2["IIIF · 文本 · 流媒体微服务"]
+    B3["SRU/Z39.50 · MARCXML · 关联数据"]
+    B4["目录账户与请求接口"]
+  end
+
+  subgraph L4["数据层"]
+    direction LR
+    C1["检索索引"]
+    C2["书目/规范/档案元数据"]
+    C3["数字对象与派生文件"]
+    C4["权利与账户数据"]
+  end
+
+  subgraph L5["基础设施层"]
+    direction LR
+    D1["边缘防护与限流"]
+    D2["应用运行环境"]
+    D3["对象存储与图像/流媒体服务节点（tile.loc.gov）"]
+    D4["监控与运维"]
+  end
+
+  E["外部系统：Congress.gov API、Chronicling America、研究工具"]
+
+  U --> L1
+  L1 --> L2
+  L2 --> L3
+  L3 --> L4
+  L3 <--> E
+  L5 ==支撑==> L1
+  L5 ==支撑==> L2
+  L5 ==支撑==> L3
+  L5 ==支撑==> L4
+```
+
+**图 8 说明**：箭头表示**依赖方向**：上层依赖下层，依赖严格单向（表现层不跨过应用层直连数据层）；基础设施层以"支撑"关系作用于所有层；外部系统只与接口层往来。D2"应用运行环境"的具体技术（语言、框架、云厂商）官方未公开，不做断言。
+
+## 7.3 各层职责与依赖关系
+
+| 层次 | 主要职责 | LOC 实际对应物 | 对上层的依赖约定 |
+|---|---|---|---|
+| 表现层 | 页面交互、检索界面、资源展示 | loc.gov 页面、LCAP 目录前端、IIIF 查看器 | 只经接口层取数（`?fo=json`），不直连数据层【A】 |
+| 应用层 | 检索处理、资源聚合、访问裁决、ETL 编排 | 时序图中的编排角色【B】 | 调用接口层能力，组织业务规则（如权利裁决先于交付） |
+| 接口层 | API 与内外部交互契约 | JSON/YAML API、三类微服务、SRU/Z39.50、目录账户接口【A】 | 对上提供稳定契约，对下屏蔽数据实现 |
+| 数据层 | 元数据、索引、数字对象、权利与账户数据 | 检索索引、书目/规范记录（MARC/BIBFRAME）、storage-services【A·按职能】 | 被接口层唯一地访问 |
+| 基础设施层 | 网络、运行环境、存储节点、防护 | 边缘限流/人机挑战（可观察）、tile.loc.gov 服务节点【A/B】 | 支撑全部上层 |
+
+## 7.4 结合实际业务的合理性评价
+
+**（1）分层与业务规模匹配。** 千万级记录、亿级年请求的业务，必须把"匹配计算"（应用/接口层）与"存储"（数据层）解耦，才能独立扩展检索能力与存储能力。深层分页限制的官方解释（"翻页越深，每次请求内存代价越大"【A】）恰恰说明其检索引擎在分层边界上做了内存/性能权衡——这是分层架构真实发挥作用的证据。
+
+**（2）读写分离的雏形。** 元数据 ETL 管线（写侧，`group`/`extract_timestamp` 字段为其痕迹【A】）与检索索引（读侧）职责分明；目录侧 LCAP 负责编目、采购、流通等事务型写操作（FOLIO 平台【A】），发现侧面向读优化。这与 CQRS（命令查询职责分离）的思想高度一致，但 LOC 未公开其内部设计，故仅作为分析视角【B】。
+
+**（3）架构的主要张力：双发现入口。** loc.gov（数字馆藏）与目录（全部馆藏的书目记录）长期并存，JSON API 明示不含目录记录【A】。对架构而言，这意味着两套前端、两套检索链路、两份数据一致性负担；对用户而言，"我要找的书在哪个入口"是真实的认知成本。LCAP 的官方目标——"让用户无缝发现和获取全部馆藏，无论数字或实体"【A】——正是对这一历史张力的正面回应：以统一平台收敛发现与管理。新目录上线是第一步，数字馆藏门户与目录的进一步融合仍是可预期的架构演进方向。
+
+**（4）可扩展性、可维护性、可复用性小结。** 扩展性：新载体类型走新端点/新微服务（`/{format}` 族【A】），新管理功能经 FOLIO 开源生态扩展【A】；可维护性：接口契约稳定、存储分域，问题可按层定位，弱模式元数据契约是维护负担的主要来源；可复用性：网站即 API 消费者 + 行业标准（IIIF）+ 开源平台（FOLIO）三层复用叠加，是本案例最突出的优点。
+
+---
+
+# 八、设计模式分析
+
+**总声明**：LOC 未公开其源代码级设计，以下分析区分两种情形：其一，模式的**行为效果**有公开证据（如门面、策略、适配器、分层、MVC 分离）；其二，模式仅作为课程视角下的合理归类【B】。报告不为凑数认定 LOC 使用了全部模式。
+
+## 8.1 逐模式分析
+
+**（1）MVC 模式 —— 证据较充分【A/B】**
+基本思想：模型（数据）、视图（呈现）、控制（输入处理）分离。LOC 场景：条目页、集合页、检索页均由 JSON 数据构建，同一资源 URL 加 `fo=json` 即得数据表示【A】——数据（item/resources）与视图（HTML 页面）在物理上分离，页面只是数据的一种视图。解决的问题：界面改版不必动数据管线。优势：数据同时供给网页、API 与 Notebook 分析场景。限制：LOC 未公开其前端框架与模板机制，"控制器"如何组织属于推断【B】。
+
+**（2）分层架构模式 —— 官方行为证实【A】**
+见第七章。公开证据：API 明示不含目录记录、微服务按载体分类、限流置于边缘、ETL 与索引分离，均符合分层职责划分的外部特征。
+
+**（3）策略模式 —— 参数层面证实【A】，类结构推断【B】**
+基本思想：把可互换的算法族封装为独立策略，运行时选用。LOC 场景：排序以 `sb` 参数显式选择（date / date_desc / title_s / title_s_desc / shelf_id / shelf_id_desc），分面过滤以 `fa` 维度组合选择【A】——检索服务对外呈现的正是"可插拔的排序/过滤策略"。解决的问题：新增排序维度不改检索主流程。优势：第三方调用方可以精确复现任何排序组合。类结构层面的策略接口纯属分析构造。
+
+**（4）适配器模式 —— 协议层面证据充分【A】**
+基本思想：把不兼容的既有接口转换为目标接口。LOC 场景极其典型：其一，各部组异构元数据（MARC、MODS、Dublin Core、EAD 等）被统一聚合进 item 响应结构【A】；其二，SRU/Z39.50 网关把传统图书馆协议转换为 Web 可达服务【A】；其三，BIBFRAME 项目本身即"把 MARC 书目转换为关联数据模型"的行业适配工程【A】。解决的问题：几十个部组、多种元数据传统共存于一个 API。优势：数据源各按其传统维护，消费方只见统一模型。代价即 6.3 所述的弱模式契约。
+
+**（5）门面模式 —— 行为证据充分【A/B】**
+基本思想：为复杂子系统提供统一高层入口。LOC 场景：`/search` 端点在官方文档中明示"检索 loc.gov 网站上的一切，包括藏品、立法、网页、博客、活动、新闻"【A】——一个端点门面式地聚合了多个子站的数据；`fo`/`at` 两个参数则把格式协商与字段裁剪统一收敛在 URL 层。解决的问题：调用方无需了解各子站差异。优势：第三方只需学习一套参数契约（第六章表格即全部）。
+
+**（6）工厂模式 —— 分析构造【B】**
+基本思想：把对象创建封装起来，按类型产出。LOC 场景：条目按 `original_format`/`item_type` 呈现完全不同的详情视图与文件组织（报纸有期/页结构，音频有分段与时长）【A】，说明"按资源类型创建相应表示"的创建逻辑必然存在于某处。但"是否存在显式的工厂类"无证据，仅作为对创建行为的建模视角。
+
+**（7）仓储模式 —— 分析构造【B】**
+基本思想：在领域对象与数据访问之间放置仓库抽象。LOC 场景：资源以**稳定标识**（LCCN、handle、URL slug）被唯一定位与获取【A】，这是仓储抽象"以标识存取聚合根"的外部特征；FOLIO 平台内部"存储与服务分层"的公开架构描述也与之相容。同样，内部是否为显式仓储模式无证据。
+
+**（8）观察者模式 —— 字段痕迹，机制推断【A 字段 / B 机制】**
+基本思想：状态变化时通知依赖方。LOC 场景：`extract_timestamp`（最近一次 ETL 时间）、`group`（产生该条目的 ETL 过程列表）、`_version_`（版本号）等字段【A】说明条目数据由事件式的加工管线持续更新——"数据变化 → 触发加工 → 更新索引"是典型的发布—订阅式数据流；sitemap 的持续生成也是变化通知的产物【A】。但内部消息机制未公开。
+
+## 8.2 模式综合应用示意图
+
+```mermaid
+classDiagram
+direction LR
+class SearchFacade {
+  检索门面（统一入口 fo/at）
+  +执行检索(条件) SearchResult
+}
+class SortingStrategy {
+  <<interface>>
+  排序策略
+  +排序(结果) SearchResult
+}
+class DateSort {
+  按日期排序
+}
+class TitleSort {
+  按标题排序
+}
+class ShelfSort {
+  按索书号排序
+}
+class MetadataAdapter {
+  <<interface>>
+  元数据适配器
+  +转为统一描述(原始记录) Metadata
+}
+class MarcAdapter {
+  MARC/MARCXML 适配
+}
+class ModsAdapter {
+  MODS/DC 适配
+}
+class EadAdapter {
+  EAD 档案适配
+}
+class ResourceRepository {
+  <<interface>>
+  资源仓储
+  +按标识查找(id) Item
+}
+class IndexStore {
+  检索索引存储
+}
+class FOLIOStore {
+  目录库存储（FOLIO）
+}
+class ResourceFactory {
+  资源工厂
+  +创建数字资源(格式) DigitalResource
+}
+class DigitalResource {
+  数字对象
+}
+
+SearchFacade --> SortingStrategy : 选用排序策略
+DateSort ..|> SortingStrategy
+TitleSort ..|> SortingStrategy
+ShelfSort ..|> SortingStrategy
+SearchFacade --> MetadataAdapter : 聚合多源描述
+MarcAdapter ..|> MetadataAdapter
+ModsAdapter ..|> MetadataAdapter
+EadAdapter ..|> MetadataAdapter
+SearchFacade --> ResourceRepository : 以标识存取
+IndexStore ..|> ResourceRepository
+FOLIOStore ..|> ResourceRepository
+SearchFacade --> ResourceFactory : 按载体类型创建
+ResourceFactory ..> DigitalResource : 创建
+
+note for SearchFacade "门面：/search 一个入口聚合多子站【A】"
+note for SortingStrategy "策略：sb 参数六种排序可选【A】，类结构为推断【B】"
+note for MetadataAdapter "适配器：MARC/MODS/DC/EAD 等统一进 item 结构【A】"
+note for ResourceRepository "仓储：LCCN/handle 稳定标识定位资源【A】，抽象为推断【B】"
+```
+
+**图 9 说明**：本图将五种模式放在同一条"一次检索"的调用链上：门面接住统一入口 → 仓储按标识定位数据 → 适配器把异构元数据归一 → 工厂按载体类型组装数字对象 → 策略按参数选择排序。图中所有"接口/工厂"均为课程分析构造【B】；其对应的**行为证据**已注明【A】。
+
+## 8.3 证据等级汇总
+
+| 模式 | 行为证据 | 结构证据 | 结论 |
+|---|---|---|---|
+| MVC | 页面由 JSON 构建【A】 | 前端实现未公开 | 行为证实，结构推断 |
+| 分层架构 | 职责分布可观察【A】 | 部署未公开 | 分析框架有效 |
+| 策略 | sb/fa 参数化【A】 | 无 | 行为证实 |
+| 适配器 | 多源元数据统一、多协议网关【A】 | 无 | 行为证实 |
+| 门面 | /search 聚合、fo/at 收敛【A】 | 无 | 行为证实 |
+| 工厂 | 按类型差异化呈现【A】 | 无 | 分析构造 |
+| 仓储 | 稳定标识存取【A】 | 无 | 分析构造 |
+| 观察者 | ETL 时间/版本字段【A】 | 消息机制未公开 | 字段痕迹，机制推断 |
+
+---
+
+# 九、系统总体设计原则的综合评价
+
+## 9.1 三者联动的论证链条
+
+本章回答核心问题：**领域对象模型、应用架构和接口设计如何共同支撑一个大型数字图书馆系统的运行？** 以一次完整业务贯穿三者：
+
+1. **领域模型给出语义骨架**："Item（逻辑实体）→ DigitalResource（可寻址表示）→ File（比特流）+ Metadata（多源描述）+ AccessPolicy（权利）"的对象结构（图 1），先于任何技术实现地回答了"这个系统管理什么"。它直接决定了构件划分（图 7 中检索、资源、元数据、访问、账户五类构件恰与五组领域职责对应）。
+2. **应用架构把语义骨架落成可部署单元**：写侧（ETL→索引）与读侧（检索→聚合→交付）分离、微服务按载体分工（图 7、图 8），使千万级记录与多载体内容可以分而治之；类图中确定的服务类边界（SearchService、AccessService）成为构件间的协作契约。
+3. **接口层把构件协作固化为公开契约**：URL 即资源标识、`fo` 做表示协商、`at` 做字段裁剪、IIIF/文本/流媒体按微服务分工、限流与分页规则划定能力边界（第六章）。因为接口契约与领域语义严格同构（`/item`↔Item、`/resource`↔DigitalResource、`files`↔File、`access_restricted`↔AccessPolicy），**调用方学一套模型即可理解全部接口**——这是三者联动的最有力证据。
+4. **状态图与时序图验证闭环**：图 2/图 3 证明对象生命周期约束（限流、权利、数字化状态）真实存在于业务中；图 4/图 5/图 6 证明每一次交互都沿"门户 → 门面 → 服务 → 数据/微服务"的既定边界行进，没有绕过接口层的捷径。
+
+一言以蔽之：领域模型回答"是什么"，应用架构回答"由谁做"，接口层回答"如何约定着做"，三者以同一套资源语义贯通，因此系统可以在规模庞大、元数据异构、权利复杂、用户构成多样的条件下持续运行和扩展。
+
+## 9.2 设计原则达成度总表
+
+| 原则 | 达成情况 | 主要证据 | 不足 |
+|---|---|---|---|
+| 模块化 | ★★★★☆ | 端点/微服务/平台边界清晰【A】 | 门户与目录双前端并存 |
+| 高内聚低耦合 | ★★★★☆ | 单一职责端点、稳定标识、权利集中裁决 | 弱模式元数据契约外溢耦合给调用方【A】 |
+| 可复用 | ★★★★★ | 网站即 API 消费者、IIIF 行业标准、FOLIO 开源【A】 | — |
+| 可扩展 | ★★★★☆ | 新载体=新端点、FOLIO 可成长【A】 | 深层分页 100,000 条上限暴露索引扩展约束【A】 |
+| 可维护性 | ★★★★☆ | 分层可定位、契约稳定 | item 叶子字段不稳定加重维护成本【A】 |
+| SRP | ★★★★☆ | 构件/端点职责单一【B】 | — |
+| OCP | ★★★★☆ | 新类型扩展不改旧契约【A】 | — |
+| LSP | ★★★★☆ | item/resource 同构可互换【A】 | — |
+| ISP | ★★★★☆ | at 字段裁剪【A】 | — |
+| DIP | ★★★★☆ | 调用方只依赖 URL 契约【A】 | — |
+
+## 9.3 主要张力与改进方向【C】
+
+1. **双入口张力**：以 LCAP 为基础推动 loc.gov 与目录的发现层融合，逐步实现"一次检索覆盖数字与实体馆藏"。
+2. **契约强度张力**：在保持多源接入灵活性的同时，为核心字段（标题、日期、权利、文件清单）提供更稳定的 schema 承诺或版本化；为 429/错误响应提供结构化错误体与 `Retry-After`。
+3. **规模化调用张力**：提供游标分页或官方批量导出通道，替代"分面分片 + 本地去重"的自助模式，降低限流摩擦。
+4. **实验能力治理**：`cite_this` 等实验性字段应有明确的稳定性级别标注，帮助调用方区分"可依赖"与"试用"。
+
+---
+
+# 十、结论
+
+本报告依据系统总体设计的三个方面，对美国国会图书馆网站完成了从领域对象到架构、再到接口的全链路分析，主要结论如下：
+
+**第一，领域对象建模层面**，LOC 的业务语义可以被一组高内聚、低耦合的对象完整覆盖：以"可标识资源"为抽象根，以 Item—DigitalResource—File 三层组合为骨架，以 Metadata（多源描述）与 AccessPolicy（权利）为两条正交支撑线，辅以 SearchRequest/SearchResult/FacetValue 等会话与派生对象。类图的每一处关系都有官方可观察证据（`cite_this` 支撑泛化、`digitized=false` 支撑聚合、`segments` 支撑组合），说明该模型不是凭空构造，而是对真实业务的忠实抽象。
+
+**第二，系统应用架构层面**，系统呈现"表现层—应用层—接口层—数据层—基础设施层"的清晰分层，写侧 ETL 与读侧检索分离、微服务按载体分工、门面统一收敛入口；构件划分与领域职责一一对应，模块化、可复用与可扩展表现突出，主要历史包袱是 loc.gov 与目录的双发现入口——而 LCAP（FOLIO 平台）的换代正是对这一张力的官方回应。
+
+**第三，接口层设计层面**，"同一资源、多种表示"是全系统最优雅的接口决策：网站与第三方共用同一套资源 URL 与参数契约，`fo`/`at`/`fa`/`sb` 构成完整而自解释的请求语言，IIIF、SRU/Z39.50、MARCXML 等行业标准保证了与图书馆生态的互操作；以限流、封禁、深翻页限制构成的防御性可靠性设计务实有效，其代价是把适配责任部分转嫁给调用方，是最值得改进之处。
+
+**第四，设计模式层面**，门面、策略、适配器、分层、MVC 分离五种模式有明确的公开行为证据；工厂、仓储、观察者仅可作为分析视角。区分"证实的行为"与"推断的结构"，是本次分析在方法上最重要的自律。
+
+最终回到课程主旨：LOC 案例说明，一个大型数字图书馆系统得以运行，并非依赖某项神秘技术，而是因为**领域模型、应用架构与接口设计三者共享同一套资源语义，并通过标准化接口彼此约束**——模型决定了边界，架构决定了协作，接口决定了契约，UML 的类图、状态图、时序图、构件图与分层架构图只是把这三位一体的设计从三个不同视角显影出来。
+
+---
+
+# 附录 A：图示索引
+
+| 图号 | 名称 | 类型 | 主要支撑证据 |
+|---|---|---|---|
+| 图 1 | 领域对象 UML 类图 | 类图 | API 响应结构、cite_this、digitized、access_restricted 等【A】 |
+| 图 2 | 检索请求生命周期状态图 | 状态图 | 限流/校验页/深翻页规则【A】 |
+| 图 3 | 数字资源可得性状态图 | 状态图 | digitized/access_restricted/download_restricted/extract_timestamp【A】 |
+| 图 4 | 馆藏资源检索时序图 | 时序图 | /search 端点行为、facets/pagination 结构【A】 |
+| 图 5 | 数字资源访问时序图 | 时序图 | /item 端点、IIIF/文本/流媒体微服务【A】 |
+| 图 6 | 第三方 API 调用时序图 | 时序图 | 官方批量获取建议、限流规则【A】 |
+| 图 7 | 系统 UML 构件图 | 构件图（Mermaid 表达） | 端点分类、微服务分类、字段痕迹【A】+ 划分【B】 |
+| 图 8 | 软件分层架构图 | 架构图 | 功能分布【A】+ 分层模型【B】 |
+| 图 9 | 设计模式综合应用示意图 | 类图 | 参数契约与协议证据【A】+ 模式归类【B】 |
+
+# 附录 B：术语对照（部分）
+
+| 缩写 | 全称 | 中文 |
+|---|---|---|
+| LOC | Library of Congress | 美国国会图书馆 |
+| LCAP | Library Collections Access Platform | 馆藏访问平台 |
+| IIIF | International Image Interoperability Framework | 国际图像互操作框架 |
+| LCCN | Library of Congress Control Number | 国会图书馆控制号 |
+| SRU | Search/Retrieval via URL | 基于 URL 的检索协议 |
+| ETL | Extract-Transform-Load | 抽取—转换—装载 |
+| OCR | Optical Character Recognition | 光学字符识别 |
+| EAD | Encoded Archival Description | 编码档案描述 |
+
+# 参考资料（均为官方或官方发布渠道【A】）
+
+1. APIs at the Library of Congress：https://www.loc.gov/apis/
+2. JSON/YAML for LoC.gov（总览、请求、端点、参数、响应结构、限流）：https://www.loc.gov/apis/json-and-yaml/ （含 /requests/、/requests/endpoints/、/requests/parameters/、/responses/item-and-resource/、/working-within-limits/）
+3. Image Services（IIIF）：https://www.loc.gov/apis/micro-services/image-services/ ；Text / Streaming Services：https://www.loc.gov/apis/micro-services/
+4. Additional APIs and Data Services：https://www.loc.gov/apis/additional-apis/
+5. LCAP 上线新闻稿（PRN 25-056，2025-08-19）：https://www.loc.gov/item/prn-25-056/
+6. 新目录指南：https://guides.loc.gov/catalog ；研究者须知：https://guides.loc.gov/catalog/information-for-researchers
+7. NISO 报道：LOC 选定 FOLIO 与 EBSCO 实施 LCAP：https://niso.org/node/27977
+8. LOC 馆情通报（ALA Annual 2023 Update，含 ILS 记录量与 Z39.50/SRU 请求量）：https://www.loc.gov/static/portals/librarians/american-library-association/annual/pdf/lc-update-ala-annual-2023.pdf
+9. 研究对象站点：https://www.loc.gov/ 、https://catalog.loc.gov/
